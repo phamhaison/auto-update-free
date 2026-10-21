@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Auto-Update-Free
+Comment=Tự động quét và cập nhật mô hình AI miễn phí từ 9router/OmniRouter vào OpenCode
+Exec=/home/haison/bin/auto-update-free
+Icon=auto-update-free
+Terminal=false
+Categories=Development;Utility;Network;
+StartupNotify=true
+StartupWMClass=Auto-update-free
+TryExec=/home/haison/bin/auto-update-free

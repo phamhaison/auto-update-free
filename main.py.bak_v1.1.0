@@ -1,0 +1,1151 @@
+#!/usr/bin/env python3
+"""
+Auto-Update-Free: Modern GUI application to fetch free models from 9router and OmniRouter
+and update OpenCode configuration safely.
+"""
+
+import json
+import os
+import sys
+import threading
+import time
+import queue
+import tkinter as tk
+from tkinter import messagebox
+from typing import Dict, List, Optional, Any, Callable
+import requests
+from pathlib import Path
+
+import customtkinter as ctk
+
+
+# ==================== CONFIGURATION ====================
+ctk.set_appearance_mode("system")
+ctk.set_default_color_theme("blue")
+
+APP_NAME = "Auto-Update-Free"
+APP_VERSION = "1.0.0"
+CONFIG_DIR = Path.home() / ".config" / "auto-update-free"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+OPENCODE_CONFIG = Path.home() / ".config" / "opencode" / "opencode.jsonc"
+
+
+# ==================== UTILITY CLASSES ====================
+class ConfigManager:
+    DEFAULT_CONFIG = {
+        "9router": {
+            "endpoint": "http://localhost:20128/v1",
+            "api_key": "sk-921042c36766f489-qjn67j-65503176"
+        },
+        "omnirouter": {
+            "endpoint": "http://son-server.tail8cd54f.ts.net:20128/v1",
+            "api_key": "sk-c8231f142e2df954-6df89e-431c37d5"
+        }
+    }
+    
+    @classmethod
+    def load(cls) -> Dict:
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+                merged = cls.DEFAULT_CONFIG.copy()
+                merged.update(config)
+                for key in cls.DEFAULT_CONFIG:
+                    if key not in merged:
+                        merged[key] = cls.DEFAULT_CONFIG[key]
+                    elif isinstance(cls.DEFAULT_CONFIG[key], dict):
+                        for subkey in cls.DEFAULT_CONFIG[key]:
+                            if subkey not in merged[key]:
+                                merged[key][subkey] = cls.DEFAULT_CONFIG[key][subkey]
+                return merged
+            except Exception:
+                pass
+        return cls.DEFAULT_CONFIG.copy()
+    
+    @classmethod
+    def save(cls, config: Dict) -> bool:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(config, f, indent=2)
+            return True
+        except Exception as e:
+            print(f"Failed to save config: {e}")
+            return False
+
+
+class APIClient:
+    def __init__(self, endpoint: str, api_key: str, timeout: int = 30):
+        self.endpoint = endpoint.rstrip('/')
+        self.api_key = api_key
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        })
+    
+    def health_check(self) -> bool:
+        try:
+            health_url = self.endpoint.replace('/v1', '') + '/api/health'
+            resp = self.session.get(health_url, timeout=10)
+            if resp.status_code == 200:
+                return resp.json().get('status') == 'ok'
+        except Exception:
+            pass
+        try:
+            resp = self.session.get(f"{self.endpoint}/models", timeout=10)
+            return resp.status_code == 200
+        except Exception:
+            return False
+    
+    def get_models(self) -> List[Dict]:
+        try:
+            resp = self.session.get(f"{self.endpoint}/models", timeout=self.timeout)
+            if resp.status_code == 200:
+                return resp.json().get('data', [])
+        except Exception as e:
+            print(f"Error fetching models: {e}")
+        return []
+    
+    def test_model(self, model_id: str) -> bool:
+        try:
+            resp = self.session.post(
+                f"{self.endpoint}/chat/completions",
+                json={"model": model_id, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 5},
+                timeout=30
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+
+class OpenCodeConfigManager:
+    @classmethod
+    def load(cls) -> Dict:
+        if not OPENCODE_CONFIG.exists():
+            return {"$schema": "https://opencode.ai/config.json", "mcp": {}, "provider": {}}
+        try:
+            raw = OPENCODE_CONFIG.read_text()
+            lines = raw.split('\n')
+            clean = []
+            for line in lines:
+                idx = line.find('//')
+                if idx >= 0:
+                    in_str = False
+                    for i, ch in enumerate(line):
+                        if ch == '"' and (i == 0 or line[i-1] != '\\'):
+                            in_str = not in_str
+                        if i == idx and not in_str:
+                            line = line[:idx]
+                            break
+                clean.append(line)
+            text = '\n'.join(clean)
+            text = __import__('re').sub(r',\s*([}\]])', r'\1', text)
+            return json.loads(text) if text.strip() else {}
+        except Exception as e:
+            print(f"Error loading OpenCode config: {e}")
+            return {"$schema": "https://opencode.ai/config.json", "mcp": {}, "provider": {}}
+    
+    @classmethod
+    def save(cls, config: Dict) -> bool:
+        try:
+            OPENCODE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            if OPENCODE_CONFIG.exists():
+                backup = OPENCODE_CONFIG.with_suffix(f".jsonc.bak.{int(time.time())}")
+                OPENCODE_CONFIG.rename(backup)
+            with open(OPENCODE_CONFIG, 'w') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+                f.write('\n')
+            return True
+        except Exception as e:
+            print(f"Error saving OpenCode config: {e}")
+            return False
+
+
+class ModelAnalyzer:
+    FREE_KEYWORDS = ['free', 'gratis', 'no-cost', 'freemium', ':free']
+    COMBO_KEYWORDS = ['combo', 'gateway', 'auto', 'router', 'link', 'pool', 'bazaar', 'kilo', 'ollama', 'openrouter', 'pollinations', 'poolside', 'bazaarlink']
+    
+    @classmethod
+    def is_free_model(cls, model_id: str, model_name: str = "") -> bool:
+        text = f"{model_id} {model_name}".lower()
+        return any(kw in text for kw in cls.FREE_KEYWORDS)
+    
+    @classmethod
+    def is_combo(cls, model_id: str, model_name: str = "") -> bool:
+        text = f"{model_id} {model_name}".lower()
+        return any(kw in text for kw in cls.COMBO_KEYWORDS)
+    
+    @classmethod
+    def categorize_models(cls, models: List[Dict]) -> Dict[str, List[Dict]]:
+        combos, free_models, other = [], [], []
+        for model in models:
+            model_id = model.get('id', '')
+            model_name = model.get('name', '') or model.get('id', '')
+            if cls.is_combo(model_id, model_name):
+                combos.append(model)
+            elif cls.is_free_model(model_id, model_name):
+                free_models.append(model)
+            else:
+                other.append(model)
+        return {'combos': combos, 'free_models': free_models, 'other': other}
+
+
+# ==================== MODERN UI COMPONENTS ====================
+class ModernCard(ctk.CTkFrame):
+    def __init__(self, master, **kwargs):
+        super().__init__(master, fg_color=("gray95", "gray15"), corner_radius=12, border_width=1, border_color=("gray80", "gray25"), **kwargs)
+
+
+class StatusBadge(ctk.CTkLabel):
+    COLORS = {
+        "success": ("#2e7d32", "#4caf50"),
+        "error": ("#c62828", "#ef5350"),
+        "warning": ("#ef6c00", "#ffa726"),
+        "info": ("#1565c0", "#42a5f5"),
+        "testing": ("#6a1b9a", "#ab47bc"),
+    }
+    def __init__(self, master, status: str, text: str = "", **kwargs):
+        fg = self.COLORS.get(status, self.COLORS["info"])[1]
+        super().__init__(master, text=text or status.capitalize(), fg_color=fg, text_color="white", corner_radius=12, font=ctk.CTkFont(size=11, weight="bold"), padx=10, pady=4, **kwargs)
+
+
+class ModelRow(ctk.CTkFrame):
+    def __init__(self, master, model_data: Dict, router_name: str, on_toggle=None, **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self.model_data = model_data
+        self.router_name = router_name
+        self.on_toggle = on_toggle
+        self.selected = False
+        
+        self.grid_columnconfigure(1, weight=1)
+        
+        self.checkbox = ctk.CTkCheckBox(self, text="", width=24, height=24, command=self._on_toggle)
+        self.checkbox.grid(row=0, column=0, padx=(12, 8), pady=8)
+        
+        info_frame = ctk.CTkFrame(self, fg_color="transparent")
+        info_frame.grid(row=0, column=1, sticky="ew", padx=8, pady=8)
+        info_frame.grid_columnconfigure(0, weight=1)
+        
+        self.id_label = ctk.CTkLabel(info_frame, text=model_data.get('id', ''), font=ctk.CTkFont(size=12, family="monospace"), anchor="w")
+        self.id_label.grid(row=0, column=0, sticky="ew")
+        
+        name = model_data.get('name', '') or model_data.get('id', '')
+        self.name_label = ctk.CTkLabel(info_frame, text=name, font=ctk.CTkFont(size=11), text_color=("gray40", "gray60"), anchor="w")
+        self.name_label.grid(row=1, column=0, sticky="ew")
+        
+        mtype = "Combo" if ModelAnalyzer.is_combo(model_data.get('id', ''), name) else ("Free" if ModelAnalyzer.is_free_model(model_data.get('id', ''), name) else "Paid")
+        badge_color = {"Combo": ("#6a1b9a", "#ab47bc"), "Free": ("#2e7d32", "#4caf50"), "Paid": ("#c62828", "#ef5350")}[mtype][1]
+        self.type_badge = ctk.CTkLabel(self, text=mtype, fg_color=badge_color, text_color="white", corner_radius=8, font=ctk.CTkFont(size=10, weight="bold"), padx=10, pady=2)
+        self.type_badge.grid(row=0, column=2, padx=(8, 12), pady=8)
+    
+    def _on_toggle(self):
+        self.selected = self.checkbox.get() == 1
+        if self.on_toggle:
+            self.on_toggle(self)
+
+
+class RouterConfigCard(ctk.CTkFrame):
+    def __init__(self, master, router_name: str, config: Dict, on_test=None, on_save=None, **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self.router_name = router_name
+        self.config = config
+        self.on_test = on_test
+        self.on_save = on_save
+        
+        self.grid_columnconfigure(1, weight=1)
+        
+        icon = "📡" if router_name == "9router" else "🌐"
+        display_name = "9router (Local)" if router_name == "9router" else "OmniRouter (NAS)"
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+        
+        ctk.CTkLabel(header, text=f"{icon}  {display_name}", font=ctk.CTkFont(size=16, weight="bold")).pack(side="left")
+        
+        self.status_indicator = ctk.CTkLabel(header, text="● Chưa test", font=ctk.CTkFont(size=11), text_color=("gray50", "gray50"))
+        self.status_indicator.pack(side="right", padx=10)
+        
+        ctk.CTkLabel(self, text="Endpoint:", font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        self.entry_endpoint = ctk.CTkEntry(self, placeholder_text="http://...", font=ctk.CTkFont(size=12, family="monospace"))
+        self.entry_endpoint.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=6)
+        self.entry_endpoint.insert(0, config.get('endpoint', ''))
+        
+        ctk.CTkLabel(self, text="API Key:", font=ctk.CTkFont(size=12)).grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
+        self.entry_api_key = ctk.CTkEntry(self, placeholder_text="sk-...", show="•", font=ctk.CTkFont(size=12, family="monospace"))
+        self.entry_api_key.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=6)
+        self.entry_api_key.insert(0, config.get('api_key', ''))
+        
+        self.show_key_var = ctk.BooleanVar(value=False)
+        self.show_key_cb = ctk.CTkCheckBox(self, text="Hiện key", variable=self.show_key_var, command=self._toggle_key_visibility, width=100)
+        self.show_key_cb.grid(row=2, column=2, padx=(5, 0), pady=6)
+        
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        
+        self.btn_test = ctk.CTkButton(btn_frame, text="🔍 Test kết nối", command=self._on_test_click, width=140, height=36, fg_color=("#1976d2", "#1565c0"), hover_color=("#1565c0", "#0d47a1"))
+        self.btn_test.pack(side="left", padx=(0, 10))
+        
+        self.btn_save = ctk.CTkButton(btn_frame, text="💾 Lưu", command=self._on_save_click, width=100, height=36, font=ctk.CTkFont(size=12, weight="bold"), fg_color=("#2e7d32", "#388e3c"), hover_color=("#1b5e20", "#2e7d32"))
+        self.btn_save.pack(side="left")
+        
+        self.test_result = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=11), text_color=("gray40", "gray60"))
+        self.test_result.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    
+    def _toggle_key_visibility(self):
+        show = self.show_key_var.get()
+        self.entry_api_key.configure(show="" if show else "•")
+    
+    def _on_test_click(self):
+        if self.on_test:
+            self.on_test(self.router_name, self.entry_endpoint.get().strip(), self.entry_api_key.get().strip())
+    
+    def _on_save_click(self):
+        if self.on_save:
+            self.on_save(self.router_name, self.entry_endpoint.get().strip(), self.entry_api_key.get().strip())
+    
+    def set_test_result(self, success: bool, message: str):
+        if success:
+            self.status_indicator.configure(text="● Đã kết nối", text_color=("#2e7d32", "#4caf50"))
+            self.test_result.configure(text=f"✅ {message}", text_color=("#2e7d32", "#4caf50"))
+        else:
+            self.status_indicator.configure(text="● Lỗi kết nối", text_color=("#c62828", "#ef5350"))
+            self.test_result.configure(text=f"❌ {message}", text_color=("#c62828", "#ef5350"))
+    
+    def set_testing(self, testing: bool):
+        self.btn_test.configure(state="disabled" if testing else "normal")
+        self.btn_test.configure(text="⏳ Đang test..." if testing else "🔍 Test kết nối")
+    
+    def get_config(self) -> Dict:
+        return {
+            'endpoint': self.entry_endpoint.get().strip(),
+            'api_key': self.entry_api_key.get().strip()
+        }
+
+
+# ==================== THREAD WORKER BASE ====================
+class WorkerThread(threading.Thread):
+    """Base worker thread with cancellation support and UI callback queue."""
+    
+    def __init__(self, app, task_name: str):
+        super().__init__(daemon=True)
+        self.app = app
+        self.task_name = task_name
+        self.cancelled = False
+        self._ui_queue: queue.Queue = queue.Queue()
+        self._result = None
+        self._error = None
+    
+    def cancel(self):
+        self.cancelled = True
+    
+    def post_ui(self, callback: Callable, *args, **kwargs):
+        """Queue a UI callback to run on main thread."""
+        self._ui_queue.put((callback, args, kwargs))
+    
+    def post_log(self, message: str):
+        self.post_ui(self.app._log, message)
+    
+    def post_status(self, text: str, color: str = "gray"):
+        self.post_ui(self.app._set_status, text, color)
+    
+    def post_progress(self, value: float):
+        self.post_ui(self.app._update_progress, value)
+    
+    def process_ui_queue(self):
+        """Process queued UI callbacks (call from main thread via after)."""
+        try:
+            while True:
+                callback, args, kwargs = self._ui_queue.get_nowait()
+                callback(*args, **kwargs)
+        except queue.Empty:
+            pass
+        if not self.cancelled and self.is_alive():
+            self.app.after(50, self.process_ui_queue)
+    
+    def run(self):
+        try:
+            self._result = self.execute()
+        except Exception as e:
+            self._error = e
+            self.post_log(f"❌ Lỗi {self.task_name}: {e}")
+        finally:
+            self.post_ui(self.on_complete)
+    
+    def execute(self):
+        raise NotImplementedError
+    
+    def on_complete(self):
+        raise NotImplementedError
+
+
+class FindModelsWorker(WorkerThread):
+    def __init__(self, app, config: Dict):
+        super().__init__(app, "tìm models")
+        self.config = config
+    
+    def execute(self):
+        total_routers = len(self.config)
+        self.post_log(f"🚀 BẮT ĐẦU QUÉT MODELS - {total_routers} router(s)")
+        self.post_status("● Khởi tạo quét models...", "blue")
+        
+        for idx, (router_name, router_config) in enumerate(self.config.items()):
+            if self.cancelled:
+                self.post_log("⏹️ Đã hủy bởi người dùng")
+                break
+            
+            router_progress_start = idx / total_routers
+            router_progress_end = (idx + 1) / total_routers
+            
+            # Phase 1: Connect
+            self.post_log(f"━━━ {router_name.upper()} ━━━")
+            self.post_log(f"🔌 [{router_name}] Bước 1/4: Kết nối đến {router_config['endpoint']}")
+            self.post_progress(router_progress_start + 0.02)
+            self.post_status(f"● {router_name}: Kết nối...", "blue")
+            
+            client = APIClient(router_config['endpoint'], router_config['api_key'])
+            
+            if not client.health_check():
+                self.post_log(f"❌ [{router_name}] Kết nối THẤT BẠI - Kiểm tra endpoint/API key")
+                continue
+            
+            self.post_log(f"✅ [{router_name}] Kết nối THÀNH CÔNG")
+            self.post_progress(router_progress_start + 0.08)
+            
+            # Phase 2: Fetch models
+            self.post_log(f"📡 [{router_name}] Bước 2/4: Lấy danh sách models qua API /v1/models")
+            self.post_progress(router_progress_start + 0.12)
+            self.post_status(f"● {router_name}: Đang tải models...", "blue")
+            
+            models = client.get_models()
+            self.post_log(f"📥 [{router_name}] Nhận được {len(models)} models từ server")
+            self.post_progress(router_progress_start + 0.18)
+            
+            # Store models
+            if router_name == '9router':
+                self.app.models_9router = models
+            else:
+                self.app.models_omnirouter = models
+            
+            # Phase 3: Categorize
+            self.post_log(f"🔍 [{router_name}] Bước 3/4: Phân loại models (Combo / Free / Paid)")
+            self.post_progress(router_progress_start + 0.22)
+            
+            categorized = ModelAnalyzer.categorize_models(models)
+            self.app.combos[router_name] = categorized['combos']
+            free_models = categorized['free_models']
+            paid_count = len(categorized['other'])
+            
+            self.post_log(f"📊 [{router_name}] Kết quả phân loại:")
+            self.post_log(f"   📦 Combos: {len(categorized['combos'])}")
+            self.post_log(f"   🆓 Free models: {len(free_models)}")
+            self.post_log(f"   💰 Paid models: {paid_count}")
+            
+            # Update UI tabs
+            self.post_ui(self.app._populate_model_tab, router_name, models)
+            self.post_ui(self.app._populate_combos_tab, router_name, categorized['combos'])
+            
+            # Phase 4: Test free models
+            self.post_log(f"🧪 [{router_name}] Bước 4/4: Test thực tế {len(free_models)} free models")
+            self.post_status(f"● {router_name}: Test {len(free_models)} free models...", "blue")
+            
+            if free_models:
+                working = self._test_free_models_batched(router_name, client, free_models, router_progress_start + 0.25, router_progress_end)
+                self.app.working_free_models[router_name] = working
+                self.post_ui(self.app._populate_working_tab, router_name, working)
+                self.post_log(f"🎯 [{router_name}] HOÀN TẤT: {len(working)}/{len(free_models)} models HOẠT ĐỘNG")
+            else:
+                self.post_log(f"⚠️ [{router_name}] Không có free model nào để test")
+        
+        self.post_log("━━━ KẾT THÚC QUÉT ━━━")
+        return True
+    
+    def _test_free_models_batched(self, router_name: str, client: APIClient, free_models: List[Dict], start_progress: float, end_progress: float) -> List[Dict]:
+        working = []
+        total = len(free_models)
+        progress_range = end_progress - start_progress
+        batch_size = 5  # Update UI every 5 models
+        
+        self.post_log(f"   🔬 Bắt đầu test {total} models (batch size: {batch_size})...")
+        
+        for i, model in enumerate(free_models):
+            if self.cancelled:
+                break
+            
+            model_id = model.get('id', '')
+            model_name = model.get('name', '') or model_id
+            
+            # Batch progress updates to avoid flooding UI
+            if i % batch_size == 0 or i == total - 1:
+                progress = start_progress + (i / max(total, 1)) * progress_range
+                self.post_progress(progress)
+                self.post_status(f"● {router_name}: Test {i+1}/{total} - {model_id[:50]}", "blue")
+            
+            # Log each test attempt (detailed)
+            self.post_log(f"   🧪 Test [{i+1}/{total}]: {model_id}")
+            
+            if client.test_model(model_id):
+                working.append(model)
+                self.post_log(f"      ✅ THÀNH CÔNG - {model_name}")
+            else:
+                self.post_log(f"      ❌ THẤT BẠI - {model_name}")
+        
+        self.post_log(f"   📋 Kết quả {router_name}: {len(working)}/{total} models hoạt động")
+        return working
+    
+    def on_complete(self):
+        self.app.testing_active = False
+        self.app.btn_find.configure(state="normal")
+        self.app.btn_update.configure(state="normal")
+        self.app.btn_test.configure(state="normal")
+        self.app._set_status("● Hoàn tất tìm kiếm", "green")
+        self.app._update_progress(1.0)
+        self.app._log("=== HOÀN TẤT TÌM KIẾM ===")
+        self.app.tabview.set("✅ Mô hình hoạt động")
+
+
+class TestSelectedWorker(WorkerThread):
+    def __init__(self, app, config: Dict, selected_models: Dict):
+        super().__init__(app, "test models")
+        self.config = config
+        self.selected_models = selected_models
+    
+    def execute(self):
+        total_models = sum(len(m) for m in self.selected_models.values())
+        self.post_log(f"🧪 BẮT ĐẦU TEST MODELS ĐÃ CHỌN - Tổng: {total_models} model(s)")
+        self.post_status("● Khởi tạo test...", "blue")
+        
+        tested = 0
+        passed = 0
+        
+        for router_name, models in self.selected_models.items():
+            if not models or self.cancelled:
+                continue
+            
+            self.post_log(f"━━━ TEST {router_name.upper()} ({len(models)} models) ━━━")
+            client = APIClient(self.config[router_name]['endpoint'], self.config[router_name]['api_key'])
+            
+            for i, model in enumerate(models):
+                if self.cancelled:
+                    self.post_log("⏹️ Đã hủy bởi người dùng")
+                    break
+                
+                model_id = model['id']
+                model_name = model.get('name', '') or model_id
+                tested += 1
+                
+                progress = tested / max(total_models, 1)
+                self.post_progress(progress)
+                self.post_status(f"● Test {tested}/{total_models}: {model_id[:50]}", "blue")
+                self.post_log(f"   🧪 [{tested}/{total_models}] {router_name}: {model_id}")
+                
+                if client.test_model(model_id):
+                    passed += 1
+                    self.post_log(f"      ✅ THÀNH CÔNG - {model_name}")
+                    if not any(w['id'] == model_id for w in self.app.working_free_models[router_name]):
+                        self.app.working_free_models[router_name].append(model)
+                        self.post_ui(self.app._add_working_model_row, router_name, model)
+                else:
+                    self.post_log(f"      ❌ THẤT BẠI - {model_name}")
+        
+        self.post_log(f"━━━ KẾT QUẢ: {passed}/{tested} models hoạt động ━━━")
+        return True
+    
+    def on_complete(self):
+        self.app.testing_active = False
+        self.app.btn_test.configure(state="normal")
+        self.app._set_status("● Hoàn tất test", "green")
+        self.app._update_stats()
+        self.app._update_progress(1.0)
+
+
+class UpdateOpenCodeWorker(WorkerThread):
+    def __init__(self, app, providers_to_add: Dict):
+        super().__init__(app, "cập nhật OpenCode")
+        self.providers_to_add = providers_to_add
+    
+    def execute(self):
+        self.post_log("📝 BẮT ĐẦU CẬP NHẬT OPENCODE CONFIG")
+        self.post_status("● Đọc cấu hình hiện tại...", "blue")
+        self.post_progress(0.1)
+        
+        config = OpenCodeConfigManager.load()
+        self.post_log(f"   📄 Đã load config hiện tại: {len(config.get('provider', {}))} provider(s) hiện có")
+        
+        config.setdefault("$schema", "https://opencode.ai/config.json")
+        config.setdefault("mcp", {})
+        config.setdefault("provider", {})
+        
+        self.post_status("● Chuẩn bị provider mới...", "blue")
+        self.post_progress(0.3)
+        
+        total_new_models = 0
+        for provider_name, provider_config in self.providers_to_add.items():
+            model_count = len(provider_config['models'])
+            total_new_models += model_count
+            self.post_log(f"   ➕ Thêm provider: {provider_name} ({model_count} models)")
+            
+            # Log sample models
+            sample_models = list(provider_config['models'].keys())[:5]
+            for m in sample_models:
+                self.post_log(f"      • {m}")
+            if len(provider_config['models']) > 5:
+                self.post_log(f"      ... và {len(provider_config['models']) - 5} models khác")
+            
+            config["provider"][provider_name] = provider_config
+        
+        self.post_status("● Ghi file cấu hình...", "blue")
+        self.post_progress(0.7)
+        
+        self.post_log(f"   💾 Backup config cũ → opencode.jsonc.bak.<timestamp>")
+        
+        if OpenCodeConfigManager.save(config):
+            self.post_log(f"✅ LƯU THÀNH CÔNG - Tổng {len(self.providers_to_add)} provider(s), {total_new_models} models")
+            self.post_ui(self.app._show_toast, "Thành công", 
+                f"Đã cập nhật OpenCode:\n• {len(self.providers_to_add)} provider(s)\n• Tổng: {total_new_models} models")
+        else:
+            raise Exception("Failed to save config")
+        
+        return True
+    
+    def on_complete(self):
+        self.app.btn_update.configure(state="normal")
+        self.app._set_status("● Sẵn sàng", "gray")
+        self.app._update_progress(1.0)
+
+
+class TestConnectionWorker(WorkerThread):
+    def __init__(self, app, router_name: str, endpoint: str, api_key: str, card):
+        super().__init__(app, f"test {router_name}")
+        self.router_name = router_name
+        self.endpoint = endpoint
+        self.api_key = api_key
+        self.card = card
+    
+    def execute(self):
+        self.post_ui(self.card.set_testing, True)
+        self.post_ui(self.card.test_result.configure, {"text": "⏳ Đang kiểm tra kết nối...", "text_color": ("#ef6c00", "#ffa726")})
+        
+        self.post_log(f"🔌 TEST KẾT NỐI: {self.router_name}")
+        self.post_log(f"   📍 Endpoint: {self.endpoint}")
+        self.post_log(f"   🔑 API Key: {self.api_key[:10]}...{self.api_key[-4:] if len(self.api_key) > 14 else '***'}")
+        
+        client = APIClient(self.endpoint, self.api_key)
+        self.post_log(f"   📡 Gọi health check...")
+        success = client.health_check()
+        
+        if success:
+            self.post_log(f"   ✅ Health check OK")
+            try:
+                self.post_log(f"   📥 Lấy danh sách models...")
+                models = client.get_models()
+                msg = f"Kết nối thành công - Tìm thấy {len(models)} models"
+                self.post_log(f"   ✅ Nhận được {len(models)} models")
+            except Exception as e:
+                msg = f"Kết nối thành công (không lấy được models: {e})"
+                self.post_log(f"   ⚠️ {msg}")
+            self.post_ui(self.card.set_test_result, True, msg)
+            self.post_log(f"✅ {self.router_name}: Kết nối thành công")
+        else:
+            self.post_log(f"   ❌ Health check THẤT BẠI")
+            self.post_ui(self.card.set_test_result, False, "Không thể kết nối đến endpoint - Kiểm tra endpoint/API key/network")
+            self.post_log(f"❌ {self.router_name}: Không thể kết nối")
+        
+        return success
+    
+    def on_complete(self):
+        self.post_ui(self.card.set_testing, False)
+
+
+# ==================== MAIN APPLICATION ====================
+class AutoUpdateFreeApp(ctk.CTk):
+    def __init__(self):
+        # Prevent multiple instances
+        import sys
+        if getattr(sys, '_auto_update_free_app_instance', None):
+            raise RuntimeError("App already running")
+        sys._auto_update_free_app_instance = self
+        
+        super().__init__()
+        
+        # Configure window
+        self.title(f"{APP_NAME} v{APP_VERSION}")
+        self.geometry("1100x750")
+        self.minsize(900, 600)
+        
+        # Set icon
+        icon_path = Path(__file__).parent / "icon.png"
+        if icon_path.exists():
+            self.iconphoto(True, tk.PhotoImage(file=str(icon_path)))
+        
+        # State
+        self.config = ConfigManager.load()
+        self.models_9router: List[Dict] = []
+        self.models_omnirouter: List[Dict] = []
+        self.working_free_models: Dict[str, List[Dict]] = {'9router': [], 'omnirouter': []}
+        self.combos: Dict[str, List[Dict]] = {'9router': [], 'omnirouter': []}
+        self.model_rows: Dict[str, List[ModelRow]] = {'9router': [], 'omnirouter': []}
+        self.testing_active = False
+        self.current_worker: Optional[WorkerThread] = None
+        self.router_cards: Dict[str, RouterConfigCard] = {}
+        
+        # UI update timer
+        self._ui_timer_id = None
+        
+        # Build UI
+        self._build_ui()
+        
+        # Center window on screen
+        self.after(100, self._center_window)
+    
+    def _center_window(self):
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.winfo_screenheight() // 2) - (h // 2)
+        self.geometry(f"+{x}+{y}")
+    
+    def _build_ui(self):
+        self.tabview = ctk.CTkTabview(self)
+        self.tabview.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        self.tab_settings = self.tabview.add("⚙️  Cài đặt")
+        self.tab_9router = self.tabview.add("📡 9router Models")
+        self.tab_omni = self.tabview.add("🌐 OmniRouter Models")
+        self.tab_working = self.tabview.add("✅ Mô hình hoạt động")
+        self.tab_combos = self.tabview.add("📦 Combos")
+        self.tab_log = self.tabview.add("📋 Nhật ký")
+        
+        self._setup_settings_tab(self.tab_settings)
+        self._setup_model_tab(self.tab_9router, '9router')
+        self._setup_model_tab(self.tab_omni, 'omnirouter')
+        self._setup_working_tab(self.tab_working)
+        self._setup_combos_tab(self.tab_combos)
+        self._setup_log_tab(self.tab_log)
+        
+        self.status_frame = ctk.CTkFrame(self, fg_color=("gray92", "gray18"), corner_radius=8, height=40)
+        self.status_frame.pack(fill="x", side="bottom", padx=20, pady=(0, 20))
+        self.status_frame.pack_propagate(False)
+        
+        self.status_label = ctk.CTkLabel(self.status_frame, text="● Sẵn sàng", font=ctk.CTkFont(size=12), text_color=("gray40", "gray60"))
+        self.status_label.pack(side="left", padx=16)
+        
+        self.stats_label = ctk.CTkLabel(self.status_frame, text="", font=ctk.CTkFont(size=11), text_color=("gray50", "gray50"))
+        self.stats_label.pack(side="right", padx=16)
+        
+        # Start UI queue processor
+        self._process_ui_queue()
+    
+    def _process_ui_queue(self):
+        if self.current_worker:
+            self.current_worker.process_ui_queue()
+        self._ui_timer_id = self.after(50, self._process_ui_queue)
+    
+    def _setup_settings_tab(self, tab: ctk.CTkFrame):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        
+        header = ctk.CTkFrame(tab, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 10))
+        header.grid_columnconfigure(0, weight=1)
+        
+        ctk.CTkLabel(header, text="⚙️  Cấu hình Router", font=ctk.CTkFont(size=24, weight="bold")).pack(side="left")
+        ctk.CTkLabel(header, text="Nhập endpoint và API key cho 9router và OmniRouter", font=ctk.CTkFont(size=13), text_color=("gray40", "gray60")).pack(side="left", padx=(15, 0))
+        
+        scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        scroll.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        scroll.grid_columnconfigure(0, weight=1)
+        
+        self.router_cards['9router'] = RouterConfigCard(
+            scroll, '9router', self.config.get('9router', {}),
+            on_test=self._test_router_connection,
+            on_save=self._save_router_config
+        )
+        self.router_cards['9router'].grid(row=0, column=0, sticky="ew", pady=(0, 16))
+        
+        self.router_cards['omnirouter'] = RouterConfigCard(
+            scroll, 'omnirouter', self.config.get('omnirouter', {}),
+            on_test=self._test_router_connection,
+            on_save=self._save_router_config
+        )
+        self.router_cards['omnirouter'].grid(row=1, column=0, sticky="ew", pady=(0, 16))
+        
+        action_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        action_frame.grid(row=2, column=0, sticky="ew", pady=(20, 0))
+        action_frame.grid_columnconfigure((0, 1, 2), weight=1)
+        
+        self.btn_find = ctk.CTkButton(action_frame, text="🔍  Tìm combos & mô hình miễn phí", command=self._start_find_models, height=48, font=ctk.CTkFont(size=14, weight="bold"), fg_color=("#1976d2", "#1565c0"), hover_color=("#1565c0", "#0d47a1"))
+        self.btn_find.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        
+        self.btn_update = ctk.CTkButton(action_frame, text="📝  Cập nhập vào OpenCode", command=self._update_opencode, height=48, font=ctk.CTkFont(size=14, weight="bold"), state="disabled", fg_color=("#2e7d32", "#388e3c"), hover_color=("#1b5e20", "#2e7d32"))
+        self.btn_update.grid(row=0, column=1, sticky="ew", padx=8)
+        
+        self.btn_test = ctk.CTkButton(action_frame, text="✅  Test mô hình đã chọn", command=self._test_selected_models, height=48, font=ctk.CTkFont(size=13), state="disabled", fg_color=("#6a1b9a", "#7b1fa2"), hover_color=("#4a148c", "#6a1b9a"))
+        self.btn_test.grid(row=0, column=2, sticky="ew", padx=(8, 0))
+        
+        self.progress_bar = ctk.CTkProgressBar(scroll, height=8, corner_radius=4)
+        self.progress_bar.grid(row=3, column=0, sticky="ew", pady=(16, 0))
+        self.progress_bar.set(0)
+    
+    def _setup_model_tab(self, tab: ctk.CTkFrame, router_name: str):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+        
+        toolbar = ctk.CTkFrame(tab, fg_color="transparent")
+        toolbar.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        
+        ctk.CTkLabel(toolbar, text=f"Tất cả models ({router_name})", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        
+        self.model_rows[router_name] = []
+        
+        btn_select_free = ctk.CTkButton(toolbar, text="✓ Chọn tất cả Free/Combo", width=160, command=lambda r=router_name: self._select_all_free(r))
+        btn_select_free.pack(side="right", padx=5)
+        
+        btn_deselect = ctk.CTkButton(toolbar, text="✗ Bỏ chọn tất cả", width=130, fg_color=("gray70", "gray30"), hover_color=("gray60", "gray40"), command=lambda r=router_name: self._deselect_all(r))
+        btn_deselect.pack(side="right", padx=5)
+        
+        scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        scroll.grid_columnconfigure(0, weight=1)
+        
+        setattr(self, f'scroll_{router_name}', scroll)
+    
+    def _setup_working_tab(self, tab: ctk.CTkFrame):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        
+        header = ctk.CTkFrame(tab, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        self.working_stats_label = ctk.CTkLabel(header, text="Chưa có mô hình nào được xác minh", font=ctk.CTkFont(size=13), text_color=("gray40", "gray60"))
+        self.working_stats_label.pack(side="left")
+        
+        self.scroll_working = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        self.scroll_working.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.scroll_working.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+    
+    def _setup_combos_tab(self, tab: ctk.CTkFrame):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        
+        header = ctk.CTkFrame(tab, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        self.combos_stats_label = ctk.CTkLabel(header, text="Chưa tìm thấy combo nào", font=ctk.CTkFont(size=13), text_color=("gray40", "gray60"))
+        self.combos_stats_label.pack(side="left")
+        
+        self.scroll_combos = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        self.scroll_combos.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.scroll_combos.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+    
+    def _setup_log_tab(self, tab: ctk.CTkFrame):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        
+        self.log_text = ctk.CTkTextbox(tab, font=ctk.CTkFont(size=11, family="monospace"), corner_radius=8)
+        self.log_text.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.log_text.configure(state="disabled")
+        
+        log_toolbar = ctk.CTkFrame(tab, fg_color="transparent")
+        log_toolbar.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        
+        ctk.CTkButton(log_toolbar, text="🗑️ Xóa", width=100, command=self._clear_log, fg_color=("gray70", "gray30")).pack(side="right", padx=5)
+        ctk.CTkButton(log_toolbar, text="💾 Lưu", width=100, command=self._save_log).pack(side="right", padx=5)
+    
+    # ===== CONFIG METHODS =====
+    def _save_router_config(self, router_name: str, endpoint: str, api_key: str):
+        if not endpoint or not api_key:
+            self._show_toast("Lỗi", f"Vui lòng nhập đầy đủ thông tin {router_name}", "error")
+            return
+        
+        self.config[router_name]['endpoint'] = endpoint
+        self.config[router_name]['api_key'] = api_key
+        
+        if ConfigManager.save(self.config):
+            self._log(f"✅ Đã lưu cấu hình {router_name}")
+            self._show_toast("Thành công", f"Cấu hình {router_name} đã được lưu")
+        else:
+            self._show_toast("Lỗi", "Không thể lưu cấu hình", "error")
+    
+    def _test_router_connection(self, router_name: str, endpoint: str, api_key: str):
+        if not endpoint or not api_key:
+            self._show_toast("Lỗi", f"Vui lòng nhập đầy đủ thông tin {router_name}", "error")
+            return
+        
+        if self.testing_active:
+            self._show_toast("Thông báo", "Đang có tác vụ khác chạy, vui lòng đợi", "warning")
+            return
+        
+        self.testing_active = True
+        card = self.router_cards[router_name]
+        worker = TestConnectionWorker(self, router_name, endpoint, api_key, card)
+        self.current_worker = worker
+        worker.start()
+    
+    def _get_current_config(self) -> Dict:
+        return {
+            '9router': self.router_cards['9router'].get_config(),
+            'omnirouter': self.router_cards['omnirouter'].get_config()
+        }
+    
+    # ===== LOGGING =====
+    def _log(self, message: str):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", f"[{time.strftime('%H:%M:%S')}] {message}\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+    
+    def _clear_log(self):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+    
+    def _save_log(self):
+        try:
+            log_file = CONFIG_DIR / f"log_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            log_file.write_text(self.log_text.get("1.0", "end"))
+            self._show_toast("Thành công", f"Đã lưu nhật ký: {log_file.name}")
+        except Exception as e:
+            self._show_toast("Lỗi", f"Không thể lưu: {e}", "error")
+    
+    def _show_toast(self, title: str, message: str, type_: str = "info"):
+        if type_ == "error":
+            messagebox.showerror(title, message)
+        elif type_ == "warning":
+            messagebox.showwarning(title, message)
+        else:
+            messagebox.showinfo(title, message)
+    
+    def _set_status(self, text: str, color: str = "gray"):
+        colors = {"gray": ("gray40", "gray60"), "green": ("#2e7d32", "#4caf50"), "red": ("#c62828", "#ef5350"), "blue": ("#1565c0", "#42a5f5"), "orange": ("#ef6c00", "#ffa726")}
+        self.status_label.configure(text=text, text_color=colors.get(color, colors["gray"]))
+    
+    def _update_progress(self, value: float):
+        self.progress_bar.set(max(0.0, min(1.0, value)))
+    
+    def _update_stats(self):
+        total_working = sum(len(v) for v in self.working_free_models.values())
+        total_combos = sum(len(v) for v in self.combos.values())
+        self.stats_label.configure(text=f"✅ {total_working} models hoạt động  |  📦 {total_combos} combos")
+        
+        if hasattr(self, 'working_stats_label'):
+            self.working_stats_label.configure(text=f"Tổng: {total_working} mô hình miễn phí đã xác minh hoạt động")
+        if hasattr(self, 'combos_stats_label'):
+            self.combos_stats_label.configure(text=f"Tổng: {total_combos} combos từ cả 2 router")
+    
+    # ===== MODEL TAB OPERATIONS =====
+    def _populate_model_tab(self, router_name: str, models: List[Dict]):
+        scroll = getattr(self, f'scroll_{router_name}')
+        for widget in scroll.winfo_children():
+            widget.destroy()
+        self.model_rows[router_name] = []
+        
+        for model in models:
+            row = ModelRow(scroll, model, router_name, on_toggle=self._on_model_toggle)
+            row.pack(fill="x", pady=2)
+            self.model_rows[router_name].append(row)
+    
+    def _on_model_toggle(self, row: ModelRow):
+        pass
+    
+    def _select_all_free(self, router_name: str):
+        for row in self.model_rows[router_name]:
+            if row.type_badge.cget("text") in ("Free", "Combo"):
+                row.checkbox.select()
+                row.selected = True
+    
+    def _deselect_all(self, router_name: str):
+        for row in self.model_rows[router_name]:
+            row.checkbox.deselect()
+            row.selected = False
+    
+    def _get_selected_models(self, router_name: str) -> List[Dict]:
+        selected = []
+        for row in self.model_rows[router_name]:
+            if row.checkbox.get() == 1:
+                selected.append(row.model_data)
+        return selected
+    
+    def _populate_working_tab(self, router_name: str, working: List[Dict]):
+        for model in working:
+            self._add_working_model_row(router_name, model)
+        self._update_stats()
+    
+    def _add_working_model_row(self, router_name: str, model: Dict):
+        row_frame = ctk.CTkFrame(self.scroll_working, fg_color=("gray90", "gray20"), corner_radius=8)
+        row_frame.pack(fill="x", pady=3, padx=5)
+        row_frame.grid_columnconfigure(1, weight=1)
+        
+        router_color = ("#1976d2", "#1565c0") if router_name == '9router' else ("#6a1b9a", "#7b1fa2")
+        router_badge = ctk.CTkLabel(row_frame, text=router_name.upper(), fg_color=router_color[1], text_color="white", corner_radius=6, font=ctk.CTkFont(size=10, weight="bold"), padx=10, pady=4)
+        router_badge.grid(row=0, column=0, padx=12, pady=10)
+        
+        info = ctk.CTkFrame(row_frame, fg_color="transparent")
+        info.grid(row=0, column=1, sticky="ew", padx=10, pady=8)
+        
+        ctk.CTkLabel(info, text=model.get('id', ''), font=ctk.CTkFont(size=12, family="monospace"), anchor="w").pack(anchor="w")
+        name = model.get('name', '') or model.get('id', '')
+        ctk.CTkLabel(info, text=name, font=ctk.CTkFont(size=11), text_color=("gray40", "gray60"), anchor="w").pack(anchor="w")
+        
+        status = StatusBadge(row_frame, "success", "✓ HOẠT ĐỘNG")
+        status.grid(row=0, column=2, padx=12, pady=10)
+    
+    def _populate_combos_tab(self, router_name: str, combos: List[Dict]):
+        for combo in combos:
+            self._add_combo_row(router_name, combo)
+        self._update_stats()
+    
+    def _add_combo_row(self, router_name: str, combo: Dict):
+        row_frame = ctk.CTkFrame(self.scroll_combos, fg_color=("gray90", "gray20"), corner_radius=8)
+        row_frame.pack(fill="x", pady=3, padx=5)
+        row_frame.grid_columnconfigure(1, weight=1)
+        
+        router_color = ("#1976d2", "#1565c0") if router_name == '9router' else ("#6a1b9a", "#7b1fa2")
+        router_badge = ctk.CTkLabel(row_frame, text=router_name.upper(), fg_color=router_color[1], text_color="white", corner_radius=6, font=ctk.CTkFont(size=10, weight="bold"), padx=10, pady=4)
+        router_badge.grid(row=0, column=0, padx=12, pady=10)
+        
+        info = ctk.CTkFrame(row_frame, fg_color="transparent")
+        info.grid(row=0, column=1, sticky="ew", padx=10, pady=8)
+        
+        ctk.CTkLabel(info, text=combo.get('id', ''), font=ctk.CTkFont(size=12, family="monospace"), anchor="w").pack(anchor="w")
+        name = combo.get('name', '') or combo.get('id', '')
+        ctk.CTkLabel(info, text=name, font=ctk.CTkFont(size=11), text_color=("gray40", "gray60"), anchor="w").pack(anchor="w")
+        
+        ctk.CTkLabel(row_frame, text="📦 Combo Router", font=ctk.CTkFont(size=11), text_color=("gray40", "gray60")).grid(row=0, column=2, padx=12, pady=10)
+    
+    # ===== BACKGROUND WORKERS =====
+    def _start_find_models(self):
+        if self.testing_active:
+            return
+        
+        config = self._get_current_config()
+        for router, cfg in config.items():
+            if not cfg['endpoint'] or not cfg['api_key']:
+                self._show_toast("Lỗi", f"Vui lòng nhập đầy đủ thông tin {router}", "error")
+                return
+        
+        self.config = config
+        ConfigManager.save(config)
+        
+        self.btn_find.configure(state="disabled")
+        self.btn_update.configure(state="disabled")
+        self.btn_test.configure(state="disabled")
+        self.testing_active = True
+        self._set_status("● Đang tìm kiếm models...", "blue")
+        self._update_progress(0)
+        
+        for router in ['9router', 'omnirouter']:
+            self._populate_model_tab(router, [])
+        for widget in self.scroll_working.winfo_children():
+            widget.destroy()
+        for widget in self.scroll_combos.winfo_children():
+            widget.destroy()
+        
+        self.working_free_models = {'9router': [], 'omnirouter': []}
+        self.combos = {'9router': [], 'omnirouter': []}
+        
+        worker = FindModelsWorker(self, config)
+        self.current_worker = worker
+        worker.start()
+    
+    def _test_selected_models(self):
+        config = self._get_current_config()
+        selected = {'9router': self._get_selected_models('9router'), 'omnirouter': self._get_selected_models('omnirouter')}
+        
+        if not any(selected.values()):
+            self._show_toast("Thông báo", "Chưa chọn mô hình nào để test", "warning")
+            return
+        
+        if self.testing_active:
+            return
+        
+        self.testing_active = True
+        self.btn_test.configure(state="disabled")
+        self._set_status("● Đang test mô hình đã chọn...", "blue")
+        
+        worker = TestSelectedWorker(self, config, selected)
+        self.current_worker = worker
+        worker.start()
+    
+    def _update_opencode(self):
+        all_working = []
+        all_combos = []
+        for router_name in ['9router', 'omnirouter']:
+            all_working.extend(self.working_free_models[router_name])
+            all_combos.extend(self.combos[router_name])
+        
+        if not all_working and not all_combos:
+            self._show_toast("Cảnh báo", "Không có mô hình hoạt động hoặc combos để cập nhật", "warning")
+            return
+        
+        msg = f"Sẽ cập nhật OpenCode với:\n• {len(all_working)} mô hình miễn phí đã xác minh\n• {len(all_combos)} combos\n\nChỉ cập nhật provider '9router' và 'omnirouter', không ảnh hưởng provider khác.\n\nTiếp tục?"
+        if not messagebox.askyesno("Xác nhận cập nhật", msg):
+            return
+        
+        providers_to_add = {}
+        
+        if self.models_9router or self.working_free_models['9router'] or self.combos['9router']:
+            models_9r = {}
+            for combo in self.combos['9router']:
+                models_9r[combo['id']] = {"name": combo.get('name', combo['id'])}
+            for model in self.working_free_models['9router']:
+                models_9r[model['id']] = {"name": model.get('name', model['id'])}
+            if models_9r:
+                providers_to_add['9router'] = {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "9router (Local) — Free Models & Combos",
+                    "options": {"baseURL": self.config['9router']['endpoint'], "apiKey": self.config['9router']['api_key']},
+                    "models": models_9r
+                }
+        
+        if self.models_omnirouter or self.working_free_models['omnirouter'] or self.combos['omnirouter']:
+            models_omni = {}
+            for combo in self.combos['omnirouter']:
+                models_omni[combo['id']] = {"name": combo.get('name', combo['id'])}
+            for model in self.working_free_models['omnirouter']:
+                models_omni[model['id']] = {"name": model.get('name', model['id'])}
+            if models_omni:
+                providers_to_add['omnirouter'] = {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "OmniRouter (NAS) — Free Models & Combos",
+                    "options": {"baseURL": self.config['omnirouter']['endpoint'], "apiKey": self.config['omnirouter']['api_key']},
+                    "models": models_omni
+                }
+        
+        self._update_progress(0)
+        self.btn_update.configure(state="disabled")
+        self._set_status("● Đang cập nhật OpenCode...", "blue")
+        
+        worker = UpdateOpenCodeWorker(self, providers_to_add)
+        self.current_worker = worker
+        worker.start()
+    
+    def on_closing(self):
+        """Handle window close event."""
+        if self.current_worker and self.current_worker.is_alive():
+            self.current_worker.cancel()
+            # Wait briefly for cleanup
+            self.current_worker.join(timeout=1.0)
+        if self._ui_timer_id:
+            self.after_cancel(self._ui_timer_id)
+        self.destroy()
+
+
+def main():
+    # Ensure single instance
+    import sys
+    if hasattr(sys, '_auto_update_free_running'):
+        print("App already running")
+        return
+    sys._auto_update_free_running = True
+    
+    app = AutoUpdateFreeApp()
+    app.protocol("WM_DELETE_WINDOW", app.on_closing)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
